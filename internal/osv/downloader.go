@@ -34,7 +34,7 @@ type OSVDownloader struct {
 	db              *database.DB
 	tempDir         string
 	osvStorageURL   string
-	processingDelay time.Duration
+	networkDelay    time.Duration // Delay for network requests only
 }
 
 // NewOSVDownloader creates a new OSV downloader instance
@@ -43,7 +43,7 @@ func NewOSVDownloader(db *database.DB) *OSVDownloader {
 		db:              db,
 		tempDir:         os.TempDir(),
 		osvStorageURL:   "https://osv-vulnerabilities.storage.googleapis.com",
-		processingDelay: 100 * time.Millisecond, // Prevent rate limiting
+		networkDelay:    100 * time.Millisecond, // Prevent rate limiting for network requests
 	}
 }
 
@@ -64,6 +64,9 @@ func (d *OSVDownloader) DownloadAndProcessEcosystems() error {
 			log.Printf("Error processing ecosystem %s: %v", ecosystem, err)
 			// Continue with other ecosystems even if one fails
 		}
+		
+		// Short delay between ecosystem downloads to avoid rate limiting
+		time.Sleep(d.networkDelay)
 	}
 	
 	return nil
@@ -87,9 +90,12 @@ func (d *OSVDownloader) processEcosystem(ecosystem, workDir string) error {
 		return fmt.Errorf("failed to create directory %s: %w", extractDir, err)
 	}
 	
+	log.Printf("Extracting %s to %s", zipPath, extractDir)
+	startTime := time.Now()
 	if err := d.extractZip(zipPath, extractDir); err != nil {
 		return fmt.Errorf("failed to extract %s: %w", zipPath, err)
 	}
+	log.Printf("Extraction completed in %v", time.Since(startTime))
 	
 	// Load the data into the database
 	loader := NewLoader(d.db)
@@ -104,6 +110,7 @@ func (d *OSVDownloader) processEcosystem(ecosystem, workDir string) error {
 // downloadFile downloads a file from a URL to a local path
 func (d *OSVDownloader) downloadFile(url, destPath string) error {
 	log.Printf("Downloading %s to %s", url, destPath)
+	startTime := time.Now()
 	
 	// Create the file
 	out, err := os.Create(destPath)
@@ -125,18 +132,17 @@ func (d *OSVDownloader) downloadFile(url, destPath string) error {
 	}
 	
 	// Write the body to file
-	_, err = io.Copy(out, resp.Body)
+	written, err := io.Copy(out, resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to save response body to %s: %w", destPath, err)
 	}
 	
+	log.Printf("Downloaded %d bytes in %v", written, time.Since(startTime))
 	return nil
 }
 
 // extractZip extracts a zip file to a directory
 func (d *OSVDownloader) extractZip(zipPath, destDir string) error {
-	log.Printf("Extracting %s to %s", zipPath, destDir)
-	
 	// Open the zip file
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -144,8 +150,11 @@ func (d *OSVDownloader) extractZip(zipPath, destDir string) error {
 	}
 	defer r.Close()
 	
+	// Log the number of files to extract
+	log.Printf("Extracting %d files from %s", len(r.File), filepath.Base(zipPath))
+	
 	// Extract each file
-	for _, f := range r.File {
+	for i, f := range r.File {
 		// Prevent path traversal vulnerabilities
 		destPath := filepath.Join(destDir, f.Name)
 		if !strings.HasPrefix(destPath, filepath.Clean(destDir)+string(os.PathSeparator)) {
@@ -170,8 +179,10 @@ func (d *OSVDownloader) extractZip(zipPath, destDir string) error {
 			return err
 		}
 		
-		// Small delay to avoid excessive resource usage
-		time.Sleep(d.processingDelay)
+		// Log progress periodically
+		if i > 0 && i%5000 == 0 {
+			log.Printf("Extracted %d/%d files from %s", i, len(r.File), filepath.Base(zipPath))
+		}
 	}
 	
 	return nil
