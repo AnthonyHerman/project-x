@@ -5,7 +5,6 @@ import (
 )
 
 // Bootstrap initializes the database schema if it doesn't exist
-// internal/database/bootstrap.go
 func Bootstrap() error {
 	db, err := Connect()
 	if err != nil {
@@ -30,7 +29,6 @@ func Bootstrap() error {
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
-
 	-- Store version ranges for vulnerabilities
 	CREATE TABLE IF NOT EXISTS affected_versions (
 		id SERIAL PRIMARY KEY,
@@ -42,7 +40,6 @@ func Bootstrap() error {
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(vuln_id, package_path)
 	);
-
 	-- Store known vulnerable functions
 	CREATE TABLE IF NOT EXISTS vulnerable_functions (
 		id SERIAL PRIMARY KEY,
@@ -56,7 +53,6 @@ func Bootstrap() error {
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(vuln_id, package_path, function_name)
 	);
-
 	-- Analysis queue for vulnerabilities without function data
 	CREATE TABLE IF NOT EXISTS analysis_queue (
 		vuln_id TEXT PRIMARY KEY REFERENCES vulnerabilities(id),
@@ -67,7 +63,6 @@ func Bootstrap() error {
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
-
 	-- Create indexes for common queries
 	CREATE INDEX IF NOT EXISTS idx_vuln_package ON vulnerabilities(package);
 	CREATE INDEX IF NOT EXISTS idx_vuln_ecosystem ON vulnerabilities(ecosystem);
@@ -76,6 +71,13 @@ func Bootstrap() error {
 	CREATE INDEX IF NOT EXISTS idx_vuln_functions ON vulnerable_functions(package_path, function_name);
 	CREATE INDEX IF NOT EXISTS idx_vuln_functions_source ON vulnerable_functions(source_type);
 	CREATE INDEX IF NOT EXISTS idx_analysis_queue_priority ON analysis_queue(priority, attempts);
+
+	-- Add last_download tracking for OSV data
+	CREATE TABLE IF NOT EXISTS metadata (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 
 	// Execute the schema
