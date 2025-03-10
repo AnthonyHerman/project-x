@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	
 	"github.com/AnthonyHerman/project-x/internal/database"
 )
@@ -37,6 +38,7 @@ type CodeAnalyzer struct {
 	maxCodeSize   int    // Maximum size of code per request in bytes
 	maxFiles      int    // Maximum number of files to analyze per vulnerability
 	confidence    float64 // Minimum confidence threshold for functions
+	requestTimeout time.Duration // Timeout for LLM requests
 }
 
 // NewCodeAnalyzer creates a new code analyzer
@@ -46,12 +48,22 @@ func NewCodeAnalyzer(db *database.DB) *CodeAnalyzer {
 		llmServerURL = "http://127.0.0.1:8080/completion" // Default
 	}
 	
+	// Read timeout from environment or use a generous default for local LLMs
+	timeoutStr := os.Getenv("LLM_REQUEST_TIMEOUT")
+	timeout := 5 * time.Minute // Default to 5 minutes for local LLMs
+	if timeoutStr != "" {
+		if parsedTimeout, err := time.ParseDuration(timeoutStr); err == nil {
+			timeout = parsedTimeout
+		}
+	}
+	
 	return &CodeAnalyzer{
-		db:           db,
-		llmServerURL: llmServerURL,
-		maxCodeSize:  50000,  // 50KB max per request
-		maxFiles:     50,     // Analyze at most 50 files per vulnerability
-		confidence:   0.6,    // 60% minimum confidence
+		db:             db,
+		llmServerURL:   llmServerURL,
+		maxCodeSize:    50000,  // 50KB max per request
+		maxFiles:       50,     // Analyze at most 50 files per vulnerability
+		confidence:     0.6,    // 60% minimum confidence
+		requestTimeout: timeout,
 	}
 }
 
@@ -459,13 +471,42 @@ func (a *CodeAnalyzer) analyzeFileGroup(files []string, vulnContext string) ([]I
 		fileContents += fmt.Sprintf("\n\n--- FILE: %s ---\n%s\n", relPath, content)
 	}
 	
+	// If the content is too large, truncate it
+	if len(fileContents) > a.maxCodeSize {
+		log.Printf("Warning: File content exceeds maximum size, truncating to %d bytes", a.maxCodeSize)
+		fileContents = fileContents[:a.maxCodeSize] + "\n... (content truncated due to size limits)"
+	}
+	
 	// Create the prompt for the LLM
 	prompt := a.createAnalysisPrompt(vulnContext, fileContents)
 	
-	// Send the request to the LLM
-	functions, err := a.queryLLM(prompt)
+	// Send the request to the LLM, with retry
+	var functions []IdentifiedFunction
+	var err error
+	
+	// Try up to 3 times with increasing timeouts
+	for attempt := 1; attempt <= 3; attempt++ {
+		log.Printf("LLM analysis attempt %d of 3", attempt)
+		
+		functions, err = a.queryLLM(prompt)
+		if err == nil {
+			break // Success
+		}
+		
+		// Check if it's a timeout error
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			log.Printf("Attempt %d timed out, retrying with longer timeout", attempt)
+			// Increase timeout for next attempt
+			a.requestTimeout = a.requestTimeout * 2
+			continue
+		}
+		
+		// For other errors, just return the error
+		return nil, err
+	}
+	
 	if err != nil {
-		return nil, fmt.Errorf("failed to query LLM: %w", err)
+		return nil, fmt.Errorf("all LLM analysis attempts failed: %w", err)
 	}
 	
 	// Add file location for internal tracking
@@ -539,9 +580,19 @@ func (a *CodeAnalyzer) queryLLM(prompt string) ([]IdentifiedFunction, error) {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 	
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: a.requestTimeout,
+	}
+	
+	log.Printf("Sending request to LLM with timeout of %v", a.requestTimeout)
+	
 	// Send the request
-	resp, err := http.Post(a.llmServerURL, "application/json", bytes.NewBuffer(requestBody))
+	resp, err := client.Post(a.llmServerURL, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
+		if os.IsTimeout(err) || strings.Contains(err.Error(), "timeout") {
+			return nil, fmt.Errorf("LLM request timed out after %v: %w", a.requestTimeout, err)
+		}
 		return nil, fmt.Errorf("failed to send request to LLM: %w", err)
 	}
 	defer resp.Body.Close()
@@ -575,6 +626,17 @@ func (a *CodeAnalyzer) queryLLM(prompt string) ([]IdentifiedFunction, error) {
 	// Parse the JSON
 	var functions []IdentifiedFunction
 	if err := json.Unmarshal([]byte(responseText), &functions); err != nil {
+		// If JSON parsing fails, try to salvage any JSON-looking parts
+		if jsonStart := strings.Index(responseText, "["); jsonStart >= 0 {
+			if jsonEnd := strings.LastIndex(responseText, "]"); jsonEnd > jsonStart {
+				potentialJSON := responseText[jsonStart : jsonEnd+1]
+				if err := json.Unmarshal([]byte(potentialJSON), &functions); err == nil {
+					log.Printf("Warning: Had to extract JSON from malformed response")
+					return functions, nil
+				}
+			}
+		}
+		
 		return nil, fmt.Errorf("failed to parse LLM response as JSON: %w\nResponse text: %s", err, responseText)
 	}
 	
