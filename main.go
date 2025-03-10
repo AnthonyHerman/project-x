@@ -48,14 +48,28 @@ func printUsage() {
 }
 
 func RunGrabAndAnalyze(vulnID string) {
-	log.Printf("Starting grab and analyze for vulnerability: %s", vulnID)
-	
-	// Create database connection
+	/* Start debugging LLM query */
+	log.Printf("Starting debug LLM query")
 	db, err := database.New()
 	if err != nil {
 		log.Fatalf("Failed to create database connection: %v", err)
 	}
 	defer db.Close()
+
+	codeAnalyzer := analyzer.NewCodeAnalyzer(db)
+
+	// Test the LLM connection first
+	err = codeAnalyzer.TestLLM()
+	if err != nil {
+		log.Printf("WARNING: LLM test failed: %v", err)
+		log.Printf("Continuing with analysis, but it may not work properly")
+	} else {
+		log.Printf("LLM test succeeded! LLM is responding correctly")
+	}
+	/* End debugging LLM query */
+
+	// Run the grab and analyze process
+	log.Printf("Starting grab and analyze for vulnerability: %s", vulnID)
 	
 	// Check if the vulnerability exists
 	var exists bool
@@ -81,9 +95,8 @@ func RunGrabAndAnalyze(vulnID string) {
 	
 	log.Printf("Successfully cloned repository to: %s", repoPath)
 	
-	// Create and run the code analyzer
+	// Create and run the code analyzer - reuse the one we created above
 	log.Printf("Starting code analysis with LLM...")
-	codeAnalyzer := analyzer.NewCodeAnalyzer(db)
 	
 	if err := codeAnalyzer.AnalyzeRepository(vulnID, repoPath); err != nil {
 		log.Fatalf("Analysis failed: %v", err)
