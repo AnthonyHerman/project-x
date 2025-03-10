@@ -9,6 +9,7 @@ import (
 	"github.com/AnthonyHerman/project-x/internal/database"
 	"github.com/AnthonyHerman/project-x/internal/osv"
 	"github.com/AnthonyHerman/project-x/internal/grabber"
+	"github.com/AnthonyHerman/project-x/internal/analyzer"
 )
 
 func main() {
@@ -80,11 +81,57 @@ func RunGrabAndAnalyze(vulnID string) {
 	
 	log.Printf("Successfully cloned repository to: %s", repoPath)
 	
-	// TODO: Add code to analyze the repository with LLM here
-	log.Printf("Analysis of repository not yet implemented")
+	// Create and run the code analyzer
+	log.Printf("Starting code analysis with LLM...")
+	codeAnalyzer := analyzer.NewCodeAnalyzer(db)
 	
-	// For now, just log the success
-	log.Printf("Grab and analyze completed for vulnerability: %s", vulnID)
+	if err := codeAnalyzer.AnalyzeRepository(vulnID, repoPath); err != nil {
+		log.Fatalf("Analysis failed: %v", err)
+	}
+	
+	// Query and display the results
+	var functions []struct {
+		PackagePath  string
+		FunctionName string
+		Confidence   float64
+		SourceType   string
+	}
+	
+	rows, err := db.Query(`
+		SELECT package_path, function_name, confidence, source_type
+		FROM vulnerable_functions
+		WHERE vuln_id = $1
+		ORDER BY confidence DESC
+	`, vulnID)
+	if err != nil {
+		log.Fatalf("Failed to query results: %v", err)
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var fn struct {
+			PackagePath  string
+			FunctionName string
+			Confidence   float64
+			SourceType   string
+		}
+		if err := rows.Scan(&fn.PackagePath, &fn.FunctionName, &fn.Confidence, &fn.SourceType); err != nil {
+			log.Fatalf("Failed to scan row: %v", err)
+		}
+		functions = append(functions, fn)
+	}
+	
+	// Display the results
+	log.Printf("Analysis completed for vulnerability: %s", vulnID)
+	if len(functions) == 0 {
+		log.Printf("No vulnerable functions identified")
+	} else {
+		log.Printf("Identified %d potentially vulnerable functions:", len(functions))
+		for i, fn := range functions {
+			log.Printf("%d. %s.%s (Confidence: %.2f, Source: %s)", 
+				i+1, fn.PackagePath, fn.FunctionName, fn.Confidence, fn.SourceType)
+		}
+	}
 }
 
 // DownloadAndBootstrap initializes the database schema and downloads
