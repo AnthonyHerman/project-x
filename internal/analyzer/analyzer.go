@@ -68,7 +68,7 @@ func NewCodeAnalyzer(db *database.DB) *CodeAnalyzer {
 	}
 }
 
-// AnalyzeRepository analyzes a repository for vulnerable functions
+// AnalyzeRepository analyzes a repository for vulnerable functions using the meta-LLM approach
 func (a *CodeAnalyzer) AnalyzeRepository(vulnID, repoPath string) error {
 	startTime := time.Now()
 	log.Printf("Analyzing repository for vulnerability %s at %s", vulnID, repoPath)
@@ -93,6 +93,153 @@ func (a *CodeAnalyzer) AnalyzeRepository(vulnID, repoPath string) error {
 		return fmt.Errorf("failed to parse vulnerability data: %w", err)
 	}
 	
+	// Use meta-LLM to generate specialized prompts for this vulnerability
+	metaResponse, err := a.generateAnalysisPrompts(vulnID, summary, details, ecosystem, packageName)
+	if err != nil {
+		log.Printf("Warning: Meta-LLM prompt generation failed: %v", err)
+		log.Printf("Falling back to standard analysis")
+		// Fall back to the original analysis method if meta-LLM fails
+		return a.standardAnalyzeRepository(vulnID, repoPath, summary, details, ecosystem, packageName, vulnData)
+	}
+	
+	log.Printf("Vulnerability analyzed as type: %s", metaResponse.Analysis.VulnType)
+	log.Printf("Attack vectors identified: %v", metaResponse.Analysis.AttackVectors)
+	
+	// Get all files in the repository for the ecosystem
+	allFiles, err := a.findRelevantFiles(repoPath, ecosystem)
+	if err != nil {
+		return fmt.Errorf("failed to find relevant files: %w", err)
+	}
+	
+	if len(allFiles) == 0 {
+		return fmt.Errorf("no relevant files found for ecosystem %s", ecosystem)
+	}
+	
+	log.Printf("Found %d relevant files for analysis", len(allFiles))
+	
+	// Use meta-LLM analysis to filter for the most relevant files
+	relevantFiles := a.useMetaLLMForFileFiltering(allFiles, &metaResponse.Analysis, metaResponse.Prompts.FileFilteringPrompt)
+	
+	// If no relevant files found, fall back to all files
+	if len(relevantFiles) == 0 {
+		log.Printf("No files matched the meta-LLM filter criteria, using all files")
+		relevantFiles = allFiles
+	}
+	
+	// Analyze by file groups using specialized prompts
+	var identifiedFunctions []IdentifiedFunction
+	
+	// Create file groups based on the maximum code size
+	fileGroups := a.groupFiles(relevantFiles, a.maxCodeSize)
+	
+	// Limit the number of groups to analyze
+	maxGroups := 3
+	if len(fileGroups) > maxGroups {
+		log.Printf("Limiting file groups from %d to %d for performance", len(fileGroups), maxGroups)
+		fileGroups = fileGroups[:maxGroups]
+	}
+	
+	// Analyze each file group with the most appropriate specialized prompt
+	for i, group := range fileGroups {
+		log.Printf("Analyzing file group %d of %d (%d files)", i+1, len(fileGroups), len(group))
+		
+		// Select the most appropriate prompt for this file group
+		specializedPrompt := a.selectPromptForFileGroup(group, &metaResponse.Prompts)
+		
+		// Create the vulnerability context
+		vulnContext := a.createVulnerabilityContext(vulnID, summary, details, ecosystem, packageName, vulnData)
+		
+		// Create a file content string
+		var fileContents string
+		for _, file := range group {
+			content, err := ioutil.ReadFile(file)
+			if err != nil {
+				log.Printf("Warning: Failed to read file %s: %v", file, err)
+				continue
+			}
+			
+			relPath := filepath.Base(file)
+			fileContents += fmt.Sprintf("\n\n--- FILE: %s ---\n%s\n", relPath, content)
+		}
+		
+		// If the content is too large, truncate it
+		if len(fileContents) > a.maxCodeSize {
+			log.Printf("Warning: File content exceeds maximum size, truncating")
+			fileContents = fileContents[:a.maxCodeSize] + "\n... (truncated)"
+		}
+		
+		// Create the full analysis prompt with the specialized template
+		fullPrompt := fmt.Sprintf(`[INST] %s
+
+VULNERABILITY INFORMATION:
+%s
+
+SOURCE CODE FILES:
+The files below contain code from the vulnerable package.
+
+%s
+
+Based on your analysis, identify functions in these files that are most likely responsible for this vulnerability.
+
+For each function you identify, provide:
+1. The package path (module or namespace)
+2. The function name (or method name)
+3. A confidence score between 0.0 and 1.0
+4. Reasoning explaining why this function is vulnerable to HOST HEADER MANIPULATION specifically
+
+Format your response as a JSON array:
+[
+  {
+    "package_path": "example.module",
+    "function_name": "process_request",
+    "confidence": 0.85,
+    "reasoning": "This function processes the Host header and uses it for access control decisions without proper validation."
+  }
+]
+
+Only respond with the properly formatted JSON array. [/INST]`, 
+			specializedPrompt, vulnContext, fileContents)
+		
+		// Send the request to the LLM
+		functions, err := a.debugQueryLLM(fullPrompt)
+		if err != nil {
+			log.Printf("Warning: Failed to analyze file group %d: %v", i+1, err)
+			continue
+		}
+		
+		// Add the functions to our list
+		identifiedFunctions = append(identifiedFunctions, functions...)
+		
+		// If we found enough functions, we can stop
+		if len(functions) >= 3 {
+			log.Printf("Found %d functions, skipping remaining file groups", len(functions))
+			break
+		}
+	}
+	
+	// Validate and adjust the results using the validation prompt
+	if len(identifiedFunctions) > 0 && metaResponse.Prompts.ResultValidationPrompt != "" {
+		validatedFunctions := a.validateResults(
+			identifiedFunctions, 
+			metaResponse.Prompts.ResultValidationPrompt,
+			fmt.Sprintf("%s\n%s", summary, details))
+		
+		// Use the validated functions if we got any
+		if len(validatedFunctions) > 0 {
+			identifiedFunctions = validatedFunctions
+		}
+	}
+	
+	// Consolidate and save the results
+	finalFunctions := a.consolidateResults(identifiedFunctions)
+	err = a.saveFunctions(vulnID, finalFunctions)
+	
+	log.Printf("Repository analysis completed in %v", time.Since(startTime))
+	return err
+}
+
+// standardAnalyzeRepository is the original analysis method, now used as a fallback
+func (a *CodeAnalyzer) standardAnalyzeRepository(vulnID, repoPath, summary, details, ecosystem, packageName string, vulnData map[string]interface{}) error {
 	// Get relevant files for the ecosystem
 	files, err := a.findRelevantFiles(repoPath, ecosystem)
 	if err != nil {
@@ -160,7 +307,6 @@ func (a *CodeAnalyzer) AnalyzeRepository(vulnID, repoPath string) error {
 	finalFunctions := a.consolidateResults(identifiedFunctions)
 	err = a.saveFunctions(vulnID, finalFunctions)
 	
-	log.Printf("Repository analysis completed in %v", time.Since(startTime))
 	return err
 }
 
